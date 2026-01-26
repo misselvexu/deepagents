@@ -42,6 +42,7 @@ from acp.schema import (
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.graph import Checkpointer, CompiledStateGraph
+from deepagents_cli.local_context import LocalContextMiddleware
 from dotenv import load_dotenv
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
@@ -87,6 +88,7 @@ class ACPDeepAgent(ACPAgent):
 
         return create_deep_agent(
             checkpointer=self._checkpointer,
+            middleware=[LocalContextMiddleware()],
             backend=FilesystemBackend(root_dir=self._root_dir, virtual_mode=True),
             interrupt_on=interrupt_config,
         )
