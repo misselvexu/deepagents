@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from acp import (
@@ -41,11 +41,12 @@ from acp.schema import (
 )
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
-from deepagents.graph import Checkpointer, CompiledStateGraph
+from deepagents.graph import Checkpointer
 from deepagents_cli.local_context import LocalContextMiddleware
 from dotenv import load_dotenv
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.pregel import Pregel
 from langgraph.types import Command, StateSnapshot
 
 from deepagents_acp.utils import (
@@ -62,48 +63,34 @@ load_dotenv()
 class ACPDeepAgent(ACPAgent):
     _conn: Client
 
-    _deepagent: CompiledStateGraph
-    _root_dir: str
-    _checkpointer: Checkpointer
+    _deepagent: Pregel
+    _agent_source: Pregel | Callable[[str], Pregel]
     _mode: str
-
-    @staticmethod
-    def _get_interrupt_config(mode_id: str) -> dict:
-        """Get interrupt configuration for a given mode"""
-        mode_to_interrupt = {
-            "ask_before_edits": {
-                "edit_file": {"allowed_decisions": ["approve", "reject"]},
-                "write_file": {"allowed_decisions": ["approve", "reject"]},
-                "write_todos": {"allowed_decisions": ["approve", "reject"]},
-            },
-            "auto": {
-                "write_todos": {"allowed_decisions": ["approve", "reject"]},
-            },
-        }
-        return mode_to_interrupt.get(mode_id, {})
-
-    def _create_deepagent(self, mode: str):
-        """Create a DeepAgent with the appropriate configuration for the given mode"""
-        interrupt_config = self._get_interrupt_config(mode)
-
-        return create_deep_agent(
-            checkpointer=self._checkpointer,
-            middleware=[LocalContextMiddleware()],
-            backend=FilesystemBackend(root_dir=self._root_dir, virtual_mode=True),
-            interrupt_on=interrupt_config,
-        )
+    _plan_created_per_session: dict[str, bool]
 
     def __init__(
         self,
-        root_dir: str,
-        checkpointer: Checkpointer,
-        mode: str,
+        agent: Pregel | Callable[[str], Pregel],
+        mode: str = "ask_before_edits",
     ):
-        self._root_dir = root_dir
-        self._checkpointer = checkpointer
+        """Initialize ACPDeepAgent with a pre-configured agent.
+
+        Args:
+            agent: Either a compiled Pregel agent (e.g., from create_deep_agent) or
+                   a callable that takes mode_id and returns a Pregel agent.
+            mode: Current mode ID (default: "ask_before_edits")
+        """
+        self._agent_source = agent
         self._mode = mode
-        self._deepagent = self._create_deepagent(mode)
+
+        # If agent is callable, call it with the mode to get the initial agent
+        if callable(agent):
+            self._deepagent = agent(mode)
+        else:
+            self._deepagent = agent
+
         self._cancelled = False
+        self._plan_created_per_session = {}
         super().__init__()
 
     def on_connect(self, conn: Client) -> None:
@@ -146,8 +133,12 @@ class ACPDeepAgent(ACPAgent):
             ),
         ]
 
+        session_id = uuid4().hex
+        # Initialize plan tracking for this session
+        self._plan_created_per_session[session_id] = False
+
         return NewSessionResponse(
-            session_id=uuid4().hex,
+            session_id=session_id,
             modes=SessionModeState(
                 available_modes=available_modes,
                 current_mode_id=self._mode,
@@ -160,8 +151,11 @@ class ACPDeepAgent(ACPAgent):
         session_id: str,
         **kwargs: Any,
     ) -> SetSessionModeResponse:
-        # Recreate the deep agent with new mode configuration
-        self._deepagent = self._create_deepagent(mode_id)
+        # Recreate the deep agent with new mode configuration if agent_source is callable
+        if callable(self._agent_source):
+            self._deepagent = self._agent_source(mode_id)
+        # If agent_source is not callable, we can't change modes dynamically
+        # but we still update the mode ID for tracking
         self._mode = mode_id
 
         return SetSessionModeResponse()
@@ -404,9 +398,7 @@ class ACPDeepAgent(ACPAgent):
             elif isinstance(block, AudioContentBlock):
                 content_blocks.extend(convert_audio_block_to_content_blocks(block))
             elif isinstance(block, ResourceContentBlock):
-                content_blocks.extend(
-                    convert_resource_block_to_content_blocks(block, root_dir=self._root_dir)
-                )
+                content_blocks.extend(convert_resource_block_to_content_blocks(block))
             elif isinstance(block, EmbeddedResourceContentBlock):
                 content_blocks.extend(convert_embedded_resource_block_to_content_blocks(block))
         # Stream the deep agent response with multimodal content
@@ -514,6 +506,16 @@ class ACPDeepAgent(ACPAgent):
                     tool_name = action.get("name", "tool")
                     tool_args = action.get("args", {})
 
+                    # Skip interrupt for write_todos if a plan was already created in this session
+                    if tool_name == "write_todos":
+                        if self._plan_created_per_session.get(session_id, False):
+                            # Plan already exists, auto-approve updates without interrupt
+                            user_decisions.append({"type": "approve"})
+                            continue
+                        else:
+                            # Mark that a plan has been created for this session
+                            self._plan_created_per_session[session_id] = True
+
                     # Create a title for the permission request
                     if tool_name == "write_todos":
                         title = "Review Plan"
@@ -556,6 +558,8 @@ class ACPDeepAgent(ACPAgent):
 
                         # If rejecting a plan, clear it and provide feedback
                         if tool_name == "write_todos" and decision_type == "reject":
+                            # Reset the plan created flag since it was rejected
+                            self._plan_created_per_session[session_id] = False
                             await self._clear_plan(session_id)
                             user_decisions.append(
                                 {
@@ -573,21 +577,61 @@ class ACPDeepAgent(ACPAgent):
                         # User cancelled, treat as rejection
                         user_decisions.append({"type": "reject"})
 
-                        # If cancelling a plan, clear it
+                        # If cancelling a plan, clear it and reset flag
                         if tool_name == "write_todos":
+                            self._plan_created_per_session[session_id] = False
                             await self._clear_plan(session_id)
             return user_decisions
 
 
-async def run_agent(root_dir: str) -> None:
+def _get_interrupt_config(mode_id: str) -> dict:
+    """Get interrupt configuration for a given mode"""
+    mode_to_interrupt = {
+        "ask_before_edits": {
+            "edit_file": {"allowed_decisions": ["approve", "reject"]},
+            "write_file": {"allowed_decisions": ["approve", "reject"]},
+            "write_todos": {"allowed_decisions": ["approve", "reject"]},
+        },
+        "auto": {
+            "write_todos": {"allowed_decisions": ["approve", "reject"]},
+        },
+    }
+    return mode_to_interrupt.get(mode_id, {})
+
+
+def create_agent_factory(checkpointer: Checkpointer) -> Callable[[str], Pregel]:
+    """Create a factory function that produces agents for different modes.
+
+    Args:
+        checkpointer: Checkpointer instance to use for all agents
+
+    Returns:
+        A callable that takes a mode_id and returns a configured Pregel agent
+    """
+
+    def agent_factory(mode_id: str) -> Pregel:
+        interrupt_config = _get_interrupt_config(mode_id)
+        return create_deep_agent(
+            checkpointer=checkpointer,
+            middleware=[LocalContextMiddleware()],
+            backend=FilesystemBackend(root_dir="/", virtual_mode=True),
+            interrupt_on=interrupt_config,
+        )
+
+    return agent_factory
+
+
+async def run_agent() -> None:
     checkpointer = MemorySaver()
 
     # Start with ask_before_edits mode (ask before edits)
     mode_id = "ask_before_edits"
 
+    # Create an agent factory that can produce agents for different modes
+    agent_factory = create_agent_factory(checkpointer=checkpointer)
+
     acp_agent = ACPDeepAgent(
-        root_dir=root_dir,
+        agent=agent_factory,
         mode=mode_id,
-        checkpointer=checkpointer,
     )
     await run_acp_agent(acp_agent)

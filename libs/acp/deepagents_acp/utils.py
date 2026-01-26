@@ -26,25 +26,11 @@ def convert_audio_block_to_content_blocks(block: AudioContentBlock):
     raise Exception("Audio is not currently supported.")
 
 
-def convert_resource_block_to_content_blocks(block: ResourceContentBlock, *, root_dir: str):
-    # Resource blocks reference external resources
+def convert_resource_block_to_content_blocks(block: ResourceContentBlock):
+    # Resource blocks reference external resources with absolute paths
     resource_text = f"[Resource: {block.name}"
     if block.uri:
-        # Truncate root_dir from path while preserving file:// prefix
-        uri = block.uri
-        has_file_prefix = uri.startswith("file://")
-        if has_file_prefix:
-            path = uri[7:]  # Remove "file://" temporarily
-        else:
-            path = uri
-
-        # Remove root_dir prefix to get path relative to agent's working directory
-        if path.startswith(root_dir):
-            path = path[len(root_dir) :].lstrip("/")
-
-        # Restore file:// prefix if it was present
-        uri = f"file://{path}" if has_file_prefix else path
-        resource_text += f"\nURI: {uri}"
+        resource_text += f"\nURI: {block.uri}"
     if block.description:
         resource_text += f"\nDescription: {block.description}"
     if block.mime_type:
